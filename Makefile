@@ -1,5 +1,5 @@
 CFLAGS = -O2
-CXXFLAGS = -O2 -I.. -std=c++14
+CXXFLAGS = -O2 -I. -std=c++14
 
 OBJS = resampler.o limiter.o
 
