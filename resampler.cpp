@@ -1,12 +1,17 @@
 #include <nall/nall.hpp>
 
-#ifndef __K54__
+#ifdef __NALL__
 #include <nall/dsp/iir/biquad.hpp>
 #include <nall/dsp/resampler/linear.hpp>
 #endif
 
+#ifdef __SOX__
+#include <soxr.h>
+#endif
+
 #include "limiter.h"
 
+#ifdef __K54__
 #include "k54/resampler.h"
 
 #ifdef __SINC__
@@ -14,10 +19,11 @@
 #else
 #define USE_QUALITY RESAMPLER_QUALITY_BLAM
 #endif
+#endif
 
 using namespace nall;
 
-#ifndef __K54__
+#ifdef __NALL__
 struct Stream {
   const uint order = 6;  //Nth-order filter (must be an even number)
   struct Channel {
@@ -82,6 +88,124 @@ struct Stream {
 };
 #endif
 
+#ifdef __SOX__
+
+#define SOX_VARIABLE_RATE 0 // bit buggy for these purposes
+
+struct Stream {
+  static const uint quality = SOXR_HQ;
+#if SOX_VARIABLE_RATE
+  static const uint octaves = 7;
+  static const uint count = 10 << octaves;
+#else
+  static const uint count = 1024;
+#endif
+  struct Channel {
+    soxr_t soxr;
+    uint samples_written;
+    uint samples_readable;
+    soxr_error_t error;
+    float ibuf[count];
+    float obuf[count];
+#if !SOX_VARIABLE_RATE
+    double inRate, outRate;
+#endif
+    Channel() {
+      soxr = 0;
+    }
+    auto init() -> void {
+      soxr_quality_spec_t q_spec = soxr_quality_spec(quality, SOX_VARIABLE_RATE ? SOXR_VR : 0);
+#if SOX_VARIABLE_RATE
+      soxr = soxr_create(1 << octaves, 1, 1, &error, NULL, &q_spec, NULL);
+#else
+      soxr = soxr_create(inRate, outRate, 1, &error, NULL, &q_spec, NULL);
+#endif
+      if (!error) {
+        samples_written = 0;
+        samples_readable = 0;
+        memset(ibuf, 0, sizeof(ibuf));
+        memset(obuf, 0, sizeof(obuf));
+      }
+    }
+    ~Channel() {
+      soxr_delete(soxr);
+    }
+    auto pending() const -> bool {
+      return !!samples_readable;
+    }
+    auto clear() -> void {
+      soxr_clear(soxr);
+      samples_written = 0;
+      samples_readable = 0;
+    }
+    auto reset(double inRate, double outRate) -> void {
+#if !SOX_VARIABLE_RATE
+      if (soxr) soxr_delete(soxr), soxr = 0;
+      this->inRate = inRate; this->outRate = outRate;
+#endif
+      if (!soxr) init();
+#if SOX_VARIABLE_RATE
+      error = soxr_set_io_ratio(soxr, inRate / outRate, 0);
+#endif
+    }
+    auto write(float sample) -> void {
+      if (samples_written < count)
+        ibuf[samples_written++] = sample;
+      if (samples_written >= count) {
+        size_t idone, odone;
+        error = soxr_process(soxr, ibuf, samples_written, &idone, obuf + samples_readable, count - samples_readable, &odone);
+        if (!error) {
+          memmove(ibuf, ibuf + idone, (samples_written - idone) * sizeof(float));
+          samples_written -= idone;
+          samples_readable += odone;
+        }
+      }
+    }
+    auto read() -> float {
+      float sample = 0.0;
+      if (samples_readable) {
+        sample = obuf[0];
+        memmove(obuf, obuf + 1, (samples_readable - 1) * sizeof(float));
+        --samples_readable;
+      }
+      return sample;
+    }
+  };
+  vector<Channel> channels;
+
+  inline auto pending() const -> bool {
+    return channels && channels[0].pending();
+  }
+
+  inline auto read(double * samples) -> uint {
+    for(auto c : range(channels)) {
+      samples[c] = channels[c].read();
+    }
+    return channels.size();
+  }
+
+  inline auto write(const double * samples) -> void {
+    for(auto c : range(channels)) {
+      double sample = samples[c];
+      channels[c].write(sample);
+    } 
+  }
+
+  auto reset(uint channels_, double inputFrequency, double outputFrequency) -> void {
+    size_t oldsize = channels.size();
+
+    if (oldsize != channels_) {
+      channels.reset();
+      channels.resize(channels_);
+    }
+
+    for(auto& channel : channels) {
+      channel.reset(inputFrequency, outputFrequency);
+    }
+  }
+};
+#endif
+
 #include <nall/main.hpp>
 auto nall::main(lstring args) -> void {
   nall::file rd, wr;
@@ -100,6 +224,10 @@ auto nall::main(lstring args) -> void {
     inFreq = 384000 * 8;
     outFreq = 44100;
   }
+  else {
+    inFreq = real( args[3] );
+    outFreq = real( args[4] );
+  }
 
 #ifdef __K54__
   resampler_init();
@@ -109,7 +237,11 @@ auto nall::main(lstring args) -> void {
   resampler_set_quality(resampler, USE_QUALITY);
 
   resampler_set_rate(resampler, inFreq / outFreq);
-#else
+#elif defined(__NALL__)
+  Stream dsp;
+
+  dsp.reset(1, inFreq, outFreq);
+#elif defined(__SOX__)
   Stream dsp;
 
   dsp.reset(1, inFreq, outFreq);
@@ -126,7 +258,11 @@ auto nall::main(lstring args) -> void {
       resampler_write_sample_float(resampler, sample);
       while (resampler_get_sample_count(resampler))
         resampler_remove_sample(resampler, 0);
-#else
+#elif defined(__NALL__)
+      dsp.write(&sample);
+      while (dsp.pending())
+        dsp.read(&sample);
+#elif defined(__SOX__)
       dsp.write(&sample);
       while (dsp.pending())
         dsp.read(&sample);
@@ -140,14 +276,13 @@ auto nall::main(lstring args) -> void {
       outFreq = 44100;
 #ifdef __K54__
       resampler_set_rate(resampler, inFreq / outFreq);
-#else
+#elif defined(__NALL__)
+      dsp.reset(1, inFreq, outFreq);
+#elif defined(__SOX__)
       dsp.reset(1, inFreq, outFreq);
 #endif
     }
   }
-
-  inFreq = nall::real( args[3] );
-  outFreq = nall::real( args[4] );
 
   if (inFreq <= 0.0 || inFreq > 384000.0) {
     print("Invalid source rate: ", inFreq, "\n\n");
@@ -171,17 +306,28 @@ auto nall::main(lstring args) -> void {
     *(uint32 *)(&sample) = sample32;
     double sampled = sample;
 #ifdef __K54__
-   resampler_write_sample_float(resampler, sampled);
-   while (resampler_get_sample_count(resampler)) {
-     sampled = resampler_get_sample_float(resampler);
-     resampler_remove_sample(resampler, 0);
-     sample = sampled;
-     uint32 sampleout32;
-     *(float *)(&sampleout32) = sample;
-     wr.writel(sampleout32, 4);
-   }
-#else
-   dsp.write(&sampled);
+    resampler_write_sample_float(resampler, sampled);
+    while (resampler_get_sample_count(resampler)) {
+      sampled = resampler_get_sample_float(resampler);
+      resampler_remove_sample(resampler, 0);
+      sample = sampled;
+      sample = lim.process_sample(sample) * 0.999;
+      uint32 sampleout32;
+      *(float *)(&sampleout32) = sample;
+      wr.writel(sampleout32, 4);
+    }
+#elif defined(__NALL__)
+    dsp.write(&sampled);
+    while (dsp.pending()) {
+      dsp.read(&sampled);
+      sample = sampled;
+      sample = lim.process_sample(sample) * 0.999;
+      uint32 sampleout32;
+      *(float *)(&sampleout32) = sample;
+      wr.writel(sampleout32, 4);
+    }
+#elif defined(__SOX__)
+    dsp.write(&sampled);
     while (dsp.pending()) {
       dsp.read(&sampled);
       sample = sampled;
