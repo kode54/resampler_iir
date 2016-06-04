@@ -90,7 +90,7 @@ struct Stream {
 
 #ifdef __SOX__
 
-#define SOX_VARIABLE_RATE 0 // bit buggy for these purposes
+#define SOX_VARIABLE_RATE 1 // bit buggy for these purposes
 
 struct Stream {
   static const uint quality = SOXR_HQ;
@@ -110,6 +110,7 @@ struct Stream {
 #if !SOX_VARIABLE_RATE
     double inRate, outRate;
 #endif
+    bool flushed;
     Channel() {
       soxr = 0;
     }
@@ -125,18 +126,35 @@ struct Stream {
         samples_readable = 0;
         memset(ibuf, 0, sizeof(ibuf));
         memset(obuf, 0, sizeof(obuf));
+        flushed = false;
       }
     }
     ~Channel() {
       soxr_delete(soxr);
     }
-    auto pending() const -> bool {
+    auto pending() -> bool {
+      if (flushed && !samples_readable) {
+        size_t idone, odone;
+        void * iptr = samples_written ? ibuf : NULL;
+        size_t * idoneptr = samples_written ? &idone : NULL;
+        error = soxr_process(soxr, iptr, samples_written, idoneptr, obuf, count, &odone);
+        if (!error) {
+          if (iptr && idone) {
+            memmove(ibuf, ibuf + idone, (samples_written - idone) * sizeof(float));
+            samples_written -= idone;
+          }
+          samples_readable += odone;
+        }
+      }
       return !!samples_readable;
     }
     auto clear() -> void {
       soxr_clear(soxr);
       samples_written = 0;
       samples_readable = 0;
+    }
+    auto flush() -> void {
+      flushed = true;
     }
     auto reset(double inRate, double outRate) -> void {
 #if !SOX_VARIABLE_RATE
@@ -173,8 +191,13 @@ struct Stream {
   };
   vector<Channel> channels;
 
-  inline auto pending() const -> bool {
+  inline auto pending() -> bool {
     return channels && channels[0].pending();
+  }
+  inline auto flush() -> void {
+    for(auto c : range(channels)) {
+      channels[c].flush();
+    }
   }
 
   inline auto read(double * samples) -> uint {
@@ -264,6 +287,8 @@ auto nall::main(lstring args) -> void {
         dsp.read(&sample);
 #elif defined(__SOX__)
       dsp.write(&sample);
+      if (count == 0)
+        dsp.flush();
       while (dsp.pending())
         dsp.read(&sample);
 #endif
@@ -338,6 +363,19 @@ auto nall::main(lstring args) -> void {
     }
 #endif
     sample32 = rd.readl(4);
+#ifdef __SOX__
+    if (sample32 == 0xFFFFFFFF) {
+      dsp.flush();
+      while (dsp.pending()) {
+        dsp.read(&sampled);
+        sample = sampled;
+        sample = lim.process_sample(sample) * 0.999;
+        uint32 sampleout32;
+        *(float *)(&sampleout32) = sample;
+        wr.writel(sampleout32, 4);
+      }
+    }
+#endif
   }
 
 #ifdef __K54__
